@@ -224,6 +224,45 @@ def follow_up_mode(config) -> str:
     email = getattr(getattr(config, "channels", None), "email", None)
     mode = getattr(email, "follow_ups", "auto")
     return mode if mode in FOLLOW_UP_MODES else "auto"
+class SignatureConfig(BaseModel):
+    """A logo under every email (see harvey/integrations/signature.py).
+
+    Empty ``logo``: no signature, and email goes out as plain text, as
+    before. Gmail, Microsoft and SMTP only.
+    """
+
+    logo: str = ""            # PNG, JPEG or GIF; relative to the project folder, or absolute
+    width: int = 120          # display width in pixels
+    alt: str = ""             # shown when images are off; empty → persona.company
+    link: str = ""            # optional https:// address the logo opens
+    direction: str = "auto"   # "rtl" for Hebrew or Arabic email, "ltr", or "auto"
+
+    @field_validator("logo", "alt", "link", mode="before")
+    @classmethod
+    def _blank_is_empty(cls, v):
+        return "" if v is None else str(v).strip()
+
+    @field_validator("width")
+    @classmethod
+    def _sane_width(cls, v: int) -> int:
+        if not 16 <= v <= 600:
+            raise ValueError("signature.width must be between 16 and 600 pixels.")
+        return v
+
+    @field_validator("link")
+    @classmethod
+    def _web_link(cls, v: str) -> str:
+        if v and not re.match(r"https?://[^\s\"<>]+$", v):
+            raise ValueError(f"signature.link '{v}' must be a web address (https://...).")
+        return v
+
+    @field_validator("direction", mode="before")
+    @classmethod
+    def _known_direction(cls, v):
+        v = (str(v) if v is not None else "auto").strip().lower() or "auto"
+        if v not in ("auto", "rtl", "ltr"):
+            raise ValueError("signature.direction must be rtl, ltr or auto.")
+        return v
 
 
 class EmailChannelConfig(BaseModel):
@@ -261,6 +300,8 @@ class EmailChannelConfig(BaseModel):
     # or the lead sheet, see SheetConfig). "off": the
     # first email only. Native providers only.
     follow_ups: str = "auto"
+    # A logo under every email (see SignatureConfig). Native providers only.
+    signature: SignatureConfig = SignatureConfig()
 
     @field_validator("warmup", mode="before")
     @classmethod
@@ -275,6 +316,10 @@ class EmailChannelConfig(BaseModel):
             raise ValueError(
                 f"follow_ups '{v}' is not valid. Use one of: {', '.join(FOLLOW_UP_MODES)}.")
         return mode
+    @field_validator("signature", mode="before")
+    @classmethod
+    def _blank_signature(cls, v):
+        return SignatureConfig() if v is None else v
 
     @field_validator("max_daily_sends")
     @classmethod
@@ -416,11 +461,14 @@ OPT_OUT_WORDS = ("no thanks", "no thank you", "unsubscribe", "stop", "remove me"
                  "opt out")
 # The same in Hebrew ('השיבו "הסר"', 'תגידו לי "לא תודה"').
 HEBREW_OPT_OUT_WORDS = ("הסר", "הסירו", "הסרה", "לא תודה", "הסירו אותי", "תורידו אותי")
+# The same in Spanish ('Responda "no, gracias"', 'Responda BAJA').
+SPANISH_OPT_OUT_WORDS = ("no gracias", "baja", "darme de baja")
 _OPT_OUT_WORD_RE = "(?:" + "|".join(
     r"[\s,]+".join(map(re.escape, w.split()))
-    for w in OPT_OUT_WORDS + HEBREW_OPT_OUT_WORDS) + ")"
+    for w in OPT_OUT_WORDS + HEBREW_OPT_OUT_WORDS + SPANISH_OPT_OUT_WORDS) + ")"
 _ASKS_FOR_OPT_OUT_RE = re.compile(
-    r"\breply(?:\s+with)?\s*[\"'\u201c\u2018]?\s*" + _OPT_OUT_WORD_RE + r"\b", re.IGNORECASE)
+    r"\b(?:reply(?:\s+with)?|(?:responda|responde|respondan|conteste|contesta|escriba)(?:\s+con)?)"
+    r"\s*[\"'\u201c\u2018]?\s*" + _OPT_OUT_WORD_RE + r"\b", re.IGNORECASE)
 # Reply / answer / write / tell me, then a few words at most ("במייל חוזר").
 _ASKS_FOR_OPT_OUT_HE_RE = re.compile(
     r"(?<!\w)ו?(?:השיב[וי]?|השב|תשיב[וי]?|ענ[הוי]|תענ[הוי]|כתוב|כתב[וי]|תכתוב|תכתב[וי]"
@@ -524,8 +572,9 @@ class ComplianceConfig(BaseModel):
         if not (_ASKS_FOR_OPT_OUT_RE.search(v) or _ASKS_FOR_OPT_OUT_HE_RE.search(v)):
             raise ValueError(
                 "opt_out_line must ask for a reply Harvey recognises as an opt-out, "
-                'e.g. Reply "no thanks" / Reply STOP, or in Hebrew השיבו "הסר". Recognised: '
-                + ", ".join(f'"{w}"' for w in OPT_OUT_WORDS + HEBREW_OPT_OUT_WORDS) + "."
+                'e.g. Reply "no thanks" / Reply STOP, in Hebrew השיבו "הסר", or in Spanish Responda BAJA. Recognised: '
+                + ", ".join(f'"{w}"' for w in OPT_OUT_WORDS + HEBREW_OPT_OUT_WORDS
+                            + SPANISH_OPT_OUT_WORDS) + "."
             )
         return v
 

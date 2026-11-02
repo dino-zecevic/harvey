@@ -93,7 +93,7 @@ that does anyway ("Best,\nSam") keeps its "Best," and has the name replaced,
 so nothing is signed twice. The Outbox preview shows it.
 
 Files: `harvey/signature.py`, `harvey/agents/sender.py`, `harvey/agents/writer.py`,
-`harvey/dashboard.py`, `harvey/web/app.js`. Tests: `tests/test_signature.py`.
+`harvey/dashboard.py`, `harvey/web/app.js`. Tests: `tests/test_persona_signature.py`.
 
 ## 6. Postal address only for some countries (`compliance.postal_address_countries`)
 
