@@ -279,6 +279,10 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
         + (f" ({brain.model})" if brain.model else "")
         + ". Change brain.provider in harvey.yaml to switch."
     )
+    from harvey.config import follow_up_mode
+    if follow_up_mode(config) == "clicked" and not config.sheet.enabled:
+        logger.warning("channels.email.follow_ups is 'clicked' but the lead sheet is off "
+                       "(sheet.enabled), so no follow-up will ever go out.")
     for notice in (sending_notice(config), compliance_notice(config)):
         if notice:
             logger.warning("=" * 60)
@@ -300,6 +304,8 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     sender = Sender(brain, state, config, env)
     handler = Handler(brain, state, config, env)
     analyst = Analyst(state)
+    from harvey.sheet_sync import SheetSync
+    sheet_sync = SheetSync(state, config, env, sender=sender)
 
     interval = config.usage.heartbeat_interval_minutes * 60
     max_calls = max(int(200 * (config.usage.max_daily_claude_percent / 100)), 1)
@@ -426,6 +432,12 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
 
             outcomes = await _run_agents(tasks)
 
+            # The lead sheet, after replies are read and before anything is
+            # sent: your clicks queue follow-ups, your statuses stop people,
+            # and anyone already in the sheet is kept out of first emails.
+            if sheet_sync.enabled and sender.is_native:
+                await sheet_sync.run()
+
             # Phase 2: send — only after every reply-reading task this cycle
             # finished reading and handling replies (it returns True; a
             # failure, exception or timeout doesn't), and only if the brain
@@ -447,6 +459,9 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                 else:
                     await record_send_phase(state, send_hold_reason([], "", ""))
                     await _run_agents([(name, run()) for name, run in send_tasks])
+                    # Rows for what just went out land in the sheet now.
+                    if sheet_sync.enabled and sender.is_native:
+                        await sheet_sync.push_only()
 
             # 6. Log the action (best-effort; never kills the loop)
             try:

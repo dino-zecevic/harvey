@@ -84,6 +84,7 @@ const STATUS = {
   not_interested: ['Not interested', 'bad'],
   bounced:        ['Bounced', 'bad'],
   write_failed:   ["Couldn't write", 'bad'],
+  in_sheet:       ['In your sheet', 'idle'],
   queued:         ['Queued', 'active'],
   opted_out:      ['Opted out', 'bad'],
   // campaigns
@@ -1612,6 +1613,8 @@ async function loadOutbox() {
   const pending = data.pending || [];
   _desk.items = pending;
   _desk.footer = data.footer || '';
+  _desk.signature = data.signature || '';
+  _desk.footerNoAddress = data.footer_no_address || '';
   // Keep the desk on the draft being edited even if the list shifted.
   const editingAt = _desk.editing ? pending.findIndex(p => p.id === _desk.editing) : -1;
   if (editingAt >= 0) _desk.i = editingAt;
@@ -1859,12 +1862,15 @@ function renderDesk(items, i) {
         escHtml(unsaved.body) + '</textarea>'
     : '<div class="subject">' + escHtml(cur.subject || '(no subject)') + '</div>' +
       '<div class="body">' + escHtml(cur.body) + '</div>';
-  // Cold email leaves with the footer underneath; show it as it will go out.
-  // Not added again when the body already ends with it, as in the Sender.
-  const added = cur.kind === 'sequence' && !(cur.body || '').trimEnd().endsWith(_desk.footer)
-    ? _desk.footer : '';
+  // Cold email leaves with the footer (signature, address, opt-out) underneath
+  // and a reply with the signature; show it as it will go out. Not added again
+  // when the body already ends with it, as in the Sender.
+  // Outside compliance.postal_address_countries a cold email leaves without the address.
+  const under = cur.kind !== 'sequence' ? (_desk.signature || '')
+    : (cur.postal === false ? _desk.footerNoAddress : _desk.footer);
+  const added = under && !(cur.body || '').trimEnd().endsWith(under) ? under : '';
   const footer = added
-    ? '<div class="desk-footer" title="Added when it sends (compliance in harvey.yaml)">' +
+    ? '<div class="desk-footer" title="Added when it sends (persona.signature and compliance in your config)">' +
         escHtml(added) + '</div>' : '';
   const actions = editing
     ? '<button class="btn btn-primary" onclick="deskSave(' + jsq(cur.id) + ')">Save</button>' +
@@ -2287,7 +2293,8 @@ async function openInGmail(ci, si, ri) {
   if (!step || !r) return;
   // Cold email carries the postal address and opt-out line, sent by hand too.
   const filled = fillMergeVars(step.body, r).trimEnd();
-  const body = filled + (c.footer && !filled.endsWith(c.footer) ? '\n\n' + c.footer : '');
+  const foot = r.footer !== undefined ? r.footer : c.footer;  // per recipient when it differs
+  const body = filled + (foot && !filled.endsWith(foot) ? '\n\n' + foot : '');
   // authuser picks the Google account Harvey sends as, not just whichever
   // one the browser happens to be signed into.
   const url = 'https://mail.google.com/mail/?view=cm&fs=1' +

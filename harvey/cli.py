@@ -289,6 +289,15 @@ def cmd_status(args):
                 else:
                     print(f"  Brain:                {label} CLI isolation flags present "
                           "(login not checked: Claude is checked by its first call)")
+                    from harvey.claude_runtime import account_status
+                    account = account_status()
+                    if account.get("loggedIn"):
+                        plan = account.get("subscriptionType") or "?"
+                        print(f"  Claude account:       {account.get('email') or '?'} "
+                              f"({plan} plan)")
+                        print(f"                        login from {account.get('configDirectory') or '?'}")
+                    else:
+                        print("  Claude account:       couldn't read (`claude auth status`)")
         elif brain_status.get("status") == "paused":
             label = {"claude": "Claude", "codex": "Codex"}.get(brain_status.get("provider"), "Brain")
             print(f"  Brain:                {label} PAUSED since {brain_status.get('since', '?')}")
@@ -946,6 +955,70 @@ def cmd_sending(args):
     asyncio.run(_run())
 
 
+def cmd_sheet(args):
+    """The lead sheet: check the connection, or sync once now."""
+    from harvey.config import follow_up_mode, load_config, load_env
+    from harvey.state import StateManager
+    from harvey.sheet_sync import SHEET_PROBLEM_KEY, Sheet, SheetSync, sheet_suppression, _label
+
+    async def _run():
+        config = load_config()
+        env = load_env()
+        state = StateManager()
+        await state.init_db()
+        print()
+        if not config.sheet.enabled:
+            print("  Lead sheet: off. Set sheet.enabled: true in your config, and\n"
+                  "  GOOGLE_SHEET_ID and GOOGLE_SHEETS_CREDENTIALS in .env.\n")
+            return
+        sender = None
+        if args.sheet_action == "sync":
+            from harvey.agents.sender import Sender
+            sender = Sender(None, state, config, env)
+        sync = SheetSync(state, config, env, sender=sender)
+        problem = sync.client.problem()
+        if problem:
+            print(f"  Lead sheet: can't connect: {problem}.\n")
+            return
+        try:
+            print(f"  Service account: {sync.client.service_account_email()}")
+            print("  (the sheet must be shared with it as an editor)")
+            sheet = Sheet(await sync.client.read(), _label(config))
+        except Exception as e:
+            print(f"  Lead sheet: can't read it: {e}\n")
+            return
+        ours = sheet.ours()
+        statuses = {}
+        for _, row in ours.values():
+            s = sheet.cell(row, "status").lower() or "(blank)"
+            statuses[s] = statuses.get(s, 0) + 1
+        found = sheet.suppression()
+        print(f"  Tab '{config.sheet.worksheet}': {len(sheet.rows)} rows, "
+              f"{len(found['domains'])} companies and {len(found['emails'])} addresses "
+              "Harvey will never email first.")
+        print(f"  Harvey's rows: {len(ours)}"
+              + (" (" + ", ".join(f"{n} {s}" for s, n in sorted(statuses.items())) + ")"
+                 if statuses else ""))
+        print(f"  Follow-ups: {follow_up_mode(config)}")
+        if args.sheet_action == "sync":
+            summary = await sync.run()
+            failed = await state.get_setting(SHEET_PROBLEM_KEY)
+            if failed:
+                print(f"\n  Sync failed: {failed}\n")
+            else:
+                print("\n  Synced: " + ", ".join(f"{k.replace('_', ' ')} {v}"
+                                                for k, v in summary.items()) + "\n")
+        else:
+            last = await sheet_suppression(state)
+            failed = await state.get_setting(SHEET_PROBLEM_KEY)
+            print(f"  Last sync read: {last['read_at'][:16].replace('T', ' ') + ' UTC' if last else 'never'}")
+            if failed:
+                print(f"  Last sync failed: {failed}")
+            print()
+
+    asyncio.run(_run())
+
+
 def main():
     from harvey.textio import utf8_stdio
     utf8_stdio()
@@ -1112,6 +1185,11 @@ def main():
                           "or show the status (default)")
     sub.set_defaults(func=cmd_trulyinbox)
 
+    sub = subparsers.add_parser(
+        "sheet", help="Lead sheet: check the Google Sheet connection, or sync it now")
+    sub.add_argument("sheet_action", nargs="?", default="status", choices=["status", "sync"])
+    sub.set_defaults(func=cmd_sheet)
+
     # harvey usage
     sub = subparsers.add_parser("usage", help="Show brain usage and quota (Claude or Codex)")
     sub.add_argument("--days", type=int, default=30, help="Breakdown window (default: 30)")
@@ -1131,6 +1209,8 @@ def main():
         sys.exit(0)
 
     try:
+        from harvey.claude_runtime import pin_account
+        pin_account(PROJECT_ROOT / ".env")
         args.func(args)
     except KeyboardInterrupt:
         print("\n  Interrupted. Goodbye.")

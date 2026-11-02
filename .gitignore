@@ -62,3 +62,6 @@ harvey.local.yaml
 # Backups and in-progress writes from `harvey train` hold the same config.
 harvey.local.yaml.*
 harvey.yaml.*
+
+# Credentials files (service-account keys and the like)
+secrets/

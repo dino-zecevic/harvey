@@ -15,12 +15,16 @@ import re
 from datetime import datetime, timezone
 
 from harvey.brain import Brain
-from harvey.config import EmailRulesError, HarveyConfig, compliance_of, load_email_rules
+from harvey.config import (
+    EmailRulesError, HarveyConfig, compliance_of, load_email_rules, signature_of,
+)
 from harvey.humanize import humanize, humanizer_enabled
+from harvey.cta import CTA_RULE, CTA_SEQUENCE_RULE, cta_config, drop_cta, link_for_prospect, place_cta
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.models.campaign import Campaign, EmailStep
 from harvey.state import WRITABLE_EMAIL_STATUSES, StateManager
 from harvey.sending_mode import sync_sending_mode
+from harvey.sheet_sync import IN_SHEET_STATUS, sheet_enabled, sheet_match
 from harvey.startups import startup_facts
 from harvey.untrusted import UNTRUSTED_RULE, fence
 
@@ -75,14 +79,19 @@ def operator_rules_block(rules: str) -> str:
     )
 
 
+SIGNATURE_RULE = ("- No sign-off and no name at the end: end on the question. Harvey adds\n"
+                  "  your signature under the email when it sends.")
+
+
 def footer_rule(config, rules: str) -> str:
     """What the prompt says about the lines Harvey adds when it sends.
 
     With operator rules it names only what Harvey really adds: an opt-out
     sentence the operator writes into the body must not sit on top of the
     configured opt_out_line, and must not be dropped when there is none."""
+    signed = "\n" + SIGNATURE_RULE if signature_of(config) else ""
     if not rules:
-        return BUILT_IN_FOOTER
+        return BUILT_IN_FOOTER + signed
     compliance = compliance_of(config)
     lines = []
     if compliance.postal_address.strip():
@@ -96,7 +105,7 @@ def footer_rule(config, rules: str) -> str:
         lines.append(
             "- Harvey adds no opt-out line. If the operator's rules give a sentence that\n"
             "  lets the reader say no, write it into the body as they say.")
-    return "\n".join(lines)
+    return "\n".join(lines) + signed
 
 
 class Writer:
@@ -153,6 +162,18 @@ class Writer:
             p for p in prospects_with_email
             if not await self.state.colleague_who_replied(p.id)
         ]
+        # Already in the lead sheet (emailed before, or in your own
+        # pipeline): no draft, and out of the 'new' pool for good.
+        if sheet_enabled(self.config):
+            keep = []
+            for p in prospects_with_email:
+                hit = await sheet_match(self.state, self.config, p)
+                if hit:
+                    await self.state.update_prospect_status(p.id, IN_SHEET_STATUS)
+                    logger.info(f"Writer: skipping {p.email}: already in your lead sheet ({hit}).")
+                else:
+                    keep.append(p)
+            prospects_with_email = keep
         if not prospects_with_email:
             logger.info(
                 "Writer: No prospects with deliverable (verified/risky) emails yet."
@@ -289,13 +310,16 @@ class Writer:
 
         drafted = 0
         for (prospect, _), draft in zip(pending, polished):
+            # The link goes in now, so the Outbox shows the email as it will
+            # leave. With no link configured, a stray placeholder is removed.
+            link = await link_for_prospect(self.state, self.config, prospect)
             item_id = await self.state.add_outbox_item(
                 prospect_id=prospect.id,
                 campaign_id=campaign_id,
                 step=1,
                 to_email=prospect.email,
-                subject=draft["subject"],
-                body=draft["body"],
+                subject=drop_cta(draft["subject"]),
+                body=place_cta(draft["body"], link),
                 send_at=now,
                 status=status,
                 provider=provider,
@@ -409,6 +433,8 @@ class Writer:
         else:
             shape = PERSONAL_SHAPE
             strict = "- Follow every STRICT EMAIL RULE above."
+        if cta_config(self.config) is not None:
+            strict += "\n" + CTA_RULE
 
         prompt += f"""
 
@@ -509,6 +535,8 @@ Pricing: {self.config.product.pricing}"""
         else:
             shape, style = SEQUENCE_SHAPE, "\n" + SEQUENCE_STYLE
             strict = "- Follow every rule in the STRICT EMAIL RULES above. No exceptions."
+        if cta_config(self.config) is not None:
+            strict += "\n" + CTA_SEQUENCE_RULE
 
         prompt += f"""
 

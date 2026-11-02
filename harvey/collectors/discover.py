@@ -1741,6 +1741,9 @@ async def run_discovery(
     # re-reading it a few hundred times would turn a config lookup into I/O
     # inside the hot loop.
     do_not_contact = live_do_not_contact(config)
+    # Companies already in the lead sheet (config: sheet) are yours: skip them too.
+    from harvey.sheet_sync import sheet_domains
+    do_not_contact = list(do_not_contact) + await sheet_domains(state, config)
 
     # Each business's base facts are written once per run; its ranks once per
     # (business, keyword), and again only if a repeat search ranks it better.

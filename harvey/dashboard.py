@@ -1020,8 +1020,8 @@ async def get_outbox_api():
         return {
             **_compliance_view(),
             "paused": await state.get_setting("sending_paused"),
-            "pending": await _with_context(
-                await state.get_outbox(status="pending_review", limit=100)),
+            "pending": await _mark_postal(state, await _with_context(
+                await state.get_outbox(status="pending_review", limit=100))),
             # Mail going out right now leads the list.
             "approved": (await state.get_outbox(status="sending", limit=10)
                          + await state.get_outbox(status="approved", limit=50)),
@@ -1210,12 +1210,50 @@ def _compliance_view() -> dict:
     """What the Sender adds under each cold email, so a reviewer sees the
     email as it will leave, and the warning when the address is missing."""
     try:
-        from harvey.config import compliance_footer_lines, compliance_notice, load_config
+        from harvey.config import compliance_notice, load_config, outgoing_footer, signature_of
         config = load_config()
-        return {"footer": "\n".join(compliance_footer_lines(config)),
+        return {"footer": outgoing_footer(config),
+                "footer_no_address": outgoing_footer(config, postal=False),
+                "signature": signature_of(config),
                 "compliance_notice": compliance_notice(config)}
     except Exception:
-        return {"footer": "", "compliance_notice": ""}
+        return {"footer": "", "footer_no_address": "", "signature": "", "compliance_notice": ""}
+
+
+async def _postal_flags(state, prospect_ids) -> dict[str, bool]:
+    """For each prospect, whether their cold email carries the postal address
+    (compliance.postal_address_countries), as the Sender decides. Empty when
+    every cold email does."""
+    try:
+        from harvey.config import compliance_of, load_config, postal_address_for
+        from harvey.send_window import recipient_country, zone_country
+        config = load_config()
+        if not compliance_of(config).postal_address_countries:
+            return {}
+    except Exception:
+        return {}
+    flags = {}
+    for pid in sorted(set(prospect_ids)):
+        try:
+            prospect = await state.get_prospect(pid)
+            if prospect is None:
+                continue
+            country = await recipient_country(state, prospect)
+            if not country and getattr(prospect, "timezone", ""):
+                country = zone_country(prospect.timezone)
+            flags[pid] = postal_address_for(config, country)
+        except Exception:
+            continue
+    return flags
+
+
+async def _mark_postal(state, items: list[dict]) -> list[dict]:
+    """Set ``postal`` on each draft: whether a cold one leaves with the address."""
+    flags = await _postal_flags(state, [i["prospect_id"] for i in items
+                                        if i.get("kind") == "sequence" and i.get("prospect_id")])
+    for item in items:
+        item["postal"] = flags.get(item.get("prospect_id"), True)
+    return items
 
 
 async def _harvey_committed_ids() -> set[str]:
@@ -1407,7 +1445,8 @@ async def get_campaigns():
     rows = await query_db("SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 100")
     harvey_sends = _harvey_can_send()
     send_as = "" if harvey_sends else _send_as()
-    footer = _compliance_view()["footer"]
+    view = _compliance_view()
+    footer = view["footer"]
     committed = await _harvey_committed_ids()
     hand_sent = await _hand_sent_ids()
     for row in rows:
@@ -1442,6 +1481,15 @@ async def get_campaigns():
                 r["can_mark_sent"] and not harvey_sends
                 and (r.get("email_status") or "guess") in HAND_SENDABLE_EMAIL
             )
+        # Sent by hand to someone outside postal_address_countries: no address.
+        hand = [r["id"] for r in row["recipients"] if r["can_send_by_hand"]]
+        if hand:
+            state = _state()
+            await state.init_db()
+            flags = await _postal_flags(state, hand)
+            for r in row["recipients"]:
+                if flags.get(r["id"]) is False:
+                    r["footer"] = view["footer_no_address"]
     return rows
 
 

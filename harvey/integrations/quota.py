@@ -8,8 +8,10 @@ counting. Responses are cached in-memory to stay polite.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -47,11 +49,27 @@ def _token_from_json_blob(blob: str) -> Optional[str]:
     return None
 
 
-def get_oauth_token() -> Optional[str]:
-    """Find the Claude Code OAuth access token on this machine.
+def keychain_service() -> str:
+    """The macOS keychain item holding the login of the config dir in use.
 
-    Tries the credentials file (Linux / CLAUDE_CONFIG_DIR overrides),
-    then the macOS keychain. Returns None when not logged in.
+    Claude Code keeps the default directory's login under "Claude
+    Code-credentials" and any CLAUDE_CONFIG_DIR's under that name plus the
+    first 8 hex digits of the SHA-256 of the directory's path."""
+    override = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if not override:
+        return KEYCHAIN_SERVICE
+    path = str(Path(override).expanduser())
+    return f"{KEYCHAIN_SERVICE}-{hashlib.sha256(path.encode()).hexdigest()[:8]}"
+
+
+def get_oauth_token() -> Optional[str]:
+    """Find the OAuth access token of the Claude login Harvey runs under.
+
+    Tries the credentials file in that login's config dir (Linux, or
+    CLAUDE_CONFIG_DIR), then the macOS keychain. With CLAUDE_CONFIG_DIR set
+    only that login counts: the gauge must never show (or throttle on)
+    another account's usage, such as a work subscription in ~/.claude.
+    Returns None when not logged in.
     """
     creds_file = claude_config_dir() / ".credentials.json"
     try:
@@ -62,24 +80,11 @@ def get_oauth_token() -> Optional[str]:
     except OSError as e:
         logger.debug(f"Could not read {creds_file}: {e}")
 
-    # Default config dir fallback, in case CLAUDE_CONFIG_DIR points elsewhere
-    default_creds = Path.home() / ".claude" / ".credentials.json"
-    if default_creds != creds_file:
-        try:
-            if default_creds.is_file():
-                token = _token_from_json_blob(default_creds.read_text(encoding="utf-8"))
-                if token:
-                    return token
-        except OSError:
-            pass
-
     if sys.platform == "darwin":
-        # Claude Code stores credentials per config dir: the default item is
-        # "Claude Code-credentials", but a CLAUDE_CONFIG_DIR install uses a
-        # hash-suffixed service name (and the default item may hold an empty
-        # token). Enumerate every matching service and take the first item
-        # with a real token.
-        for service in _keychain_services():
+        # The default login's item may hold an empty token on some installs;
+        # then any matching item will do. A pinned config dir has exactly one.
+        pinned = bool(os.environ.get("CLAUDE_CONFIG_DIR", "").strip())
+        for service in [keychain_service()] if pinned else _keychain_services():
             try:
                 result = subprocess.run(
                     ["security", "find-generic-password", "-s", service, "-w"],

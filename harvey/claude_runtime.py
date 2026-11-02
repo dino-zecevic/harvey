@@ -146,6 +146,57 @@ def find_claude(env: dict | None = None) -> str | None:
         f"re-parses the flags that keep each call isolated. {INSTALL_HINT}")
 
 
+ACCOUNT_VAR = "CLAUDE_CONFIG_DIR"
+
+
+def pin_account(env_file: Path) -> str:
+    """Use the Claude login ``CLAUDE_CONFIG_DIR`` in Harvey's .env names.
+
+    The claude CLI keeps one login per config directory (``~/.claude`` by
+    default). Someone with two subscriptions (work and personal) runs the
+    second as ``CLAUDE_CONFIG_DIR=~/.claude-personal claude``, often through
+    a shell alias, which Harvey can't see. Set in .env it wins over whatever
+    the shell that started Harvey had, so Harvey never borrows the other
+    account just because it was started from the wrong terminal. Returns
+    the directory in force, or "" for the default.
+    """
+    try:
+        from dotenv import dotenv_values
+        value = (dotenv_values(env_file).get(ACCOUNT_VAR) or "").strip()
+    except Exception:
+        value = ""
+    if value:
+        os.environ[ACCOUNT_VAR] = str(Path(value).expanduser())
+    return os.environ.get(ACCOUNT_VAR, "").strip()
+
+
+def account_status(env: dict | None = None, timeout: float = 30) -> dict:
+    """``claude auth status`` for the login Harvey's calls use: email,
+    subscriptionType, configDirectory, loggedIn. {} when it can't be read.
+    Sends no prompt."""
+    try:
+        exe = find_claude(env)
+    except ClaudeRuntimeError:
+        return {}
+    if not exe:
+        return {}
+    with tempfile.TemporaryDirectory(prefix="harvey-auth-") as cwd:
+        try:
+            out = subprocess.run(
+                [exe, "auth", "status", "--json"], cwd=cwd,
+                env=runtime_env(cwd, env), stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=timeout,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return {}
+    try:
+        import json
+        data = json.loads(out)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def runtime_env(cwd: str, base: dict | None = None) -> dict:
     """The child's environment: the operator's, minus instruction sources."""
     env = dict(os.environ if base is None else base)

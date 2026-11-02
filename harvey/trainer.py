@@ -8,6 +8,7 @@ import asyncio
 import copy
 import logging
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -43,6 +44,17 @@ FALLBACK_PATHS = [
     "/case-studies", "/customers", "/testimonials", "/faq", "/contact",
     "/team", "/our-team", "/blog", "/resources", "/integrations",
 ]
+
+# What the analysis reads. A product site's pages (features, use cases,
+# comparisons, blog) all matter, so every page goes in up to a total that
+# still fits comfortably in one prompt (~50k tokens).
+ANALYSIS_CHARS = 200_000
+PAGE_CHARS = 15_000
+# Legal boilerplate says nothing about what you sell or who buys it, and a
+# privacy policy alone can be longer than the rest of a small site.
+LEGAL_PAGE = re.compile(
+    r"^/(privacy|terms|cookie|legal|gdpr|imprint|impressum|disclaimer|dpa|eula)"
+    r"([-_./]|$)", re.I)
 
 # Cloudflare API
 CF_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
@@ -566,17 +578,18 @@ class Trainer:
 
         return config
 
-    def _get_all_content(self, max_chars: int = 60000) -> str:
-        """Combine all scraped pages into one string for analysis."""
+    def _get_all_content(self, max_chars: int = ANALYSIS_CHARS) -> str:
+        """Every scraped page except legal ones, in one string for analysis."""
         all_content = ""
         for url, content in self.scraped_pages.items():
             path = urlparse(url).path or "/"
-            # Truncate individual pages to keep total manageable
-            page_content = content[:8000] if len(content) > 8000 else content
-            all_content += f"\n\n--- PAGE: {path} ---\n{page_content}"
-            if len(all_content) > max_chars:
+            if LEGAL_PAGE.match(path):
+                continue
+            section = f"\n\n--- PAGE: {path} ---\n{content[:PAGE_CHARS]}"
+            if all_content and len(all_content) + len(section) > max_chars:
                 break
-        return all_content
+            all_content += section
+        return all_content[:max_chars]
 
     async def _extract_product_info(self) -> dict:
         """Ask Claude to extract product information from all crawled content."""
@@ -612,7 +625,7 @@ Be thorough — you have access to the full website. Extract everything relevant
 
     async def _extract_icp(self) -> dict:
         """Ask Claude to determine the ideal customer profile from all content."""
-        all_content = self._get_all_content(max_chars=40000)
+        all_content = self._get_all_content()
 
         prompt = f"""Based on this entire website, determine the Ideal Customer Profile (ICP).
 Look at case studies, testimonials, pricing tiers, feature descriptions, and target messaging
@@ -668,7 +681,7 @@ Be specific — don't guess generically. Base this on what the website actually 
 
     async def _extract_competitive_intel(self, product_info: dict) -> dict:
         """Extract competitive positioning and differentiators."""
-        all_content = self._get_all_content(max_chars=40000)
+        all_content = self._get_all_content()
 
         prompt = f"""Analyze this website for competitive intelligence.
 The product is: {product_info.get('product_name', '')}
@@ -914,6 +927,9 @@ async def run_training(url: str, output: str = "harvey.local.yaml", max_pages: i
 def main():
     """CLI entry point for training."""
     import sys
+
+    from harvey.claude_runtime import pin_account
+    pin_account(PROJECT_ROOT / ".env")
 
     if len(sys.argv) < 2:
         print("Usage: python -m harvey.trainer <website-url> [max-pages]")

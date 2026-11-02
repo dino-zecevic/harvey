@@ -35,6 +35,18 @@ class PersonaConfig(BaseModel):
     email: str
     linkedin: str
     tone: str
+    # Your sign-off block, added under every email Harvey sends (cold email
+    # and replies), above the postal address and opt-out line. Several lines
+    # are fine: in YAML write  signature: |  and the lines indented below.
+    signature: str = ""
+
+    @field_validator("signature", mode="before")
+    @classmethod
+    def _tidy_signature(cls, value):
+        if value is None:
+            return ""
+        lines = [ln.rstrip() for ln in str(value).replace("\r\n", "\n").split("\n")]
+        return "\n".join(lines).strip("\n").strip()
 
 
 class OfferConfig(BaseModel):
@@ -204,6 +216,16 @@ def operator_timezone(config) -> str:
     return getattr(quiet, "timezone", "") or "UTC"
 
 
+FOLLOW_UP_MODES = ("auto", "clicked", "off")
+
+
+def follow_up_mode(config) -> str:
+    """channels.email.follow_ups: "auto", "clicked" or "off"."""
+    email = getattr(getattr(config, "channels", None), "email", None)
+    mode = getattr(email, "follow_ups", "auto")
+    return mode if mode in FOLLOW_UP_MODES else "auto"
+
+
 class EmailChannelConfig(BaseModel):
     enabled: bool = True
     # "instantly" (legacy), "gmail" (Gmail/Workspace via API — recommended),
@@ -233,11 +255,25 @@ class EmailChannelConfig(BaseModel):
     # zone (see SendWindowConfig). None: no window, as before. Native
     # providers only; Instantly schedules its own sends.
     send_window: SendWindowConfig | None = None
+    # Which follow-ups (sequence emails after the first) go out. "auto": the
+    # whole sequence, until they reply. "clicked": only email 2, and only to
+    # people marked clicked in the lead sheet (see SheetConfig). "off": the
+    # first email only. Native providers only.
+    follow_ups: str = "auto"
 
     @field_validator("warmup", mode="before")
     @classmethod
     def _blank_warmup(cls, v):
         return WarmupConfig() if v is None else v
+
+    @field_validator("follow_ups", mode="before")
+    @classmethod
+    def _follow_up_mode(cls, v):
+        mode = str(v if v is not None else "auto").strip().lower() or "auto"
+        if mode not in FOLLOW_UP_MODES:
+            raise ValueError(
+                f"follow_ups '{v}' is not valid. Use one of: {', '.join(FOLLOW_UP_MODES)}.")
+        return mode
 
     @field_validator("max_daily_sends")
     @classmethod
@@ -401,6 +437,11 @@ class ComplianceConfig(BaseModel):
     # CAN-SPAM requires a postal address you receive mail at (a street
     # address, PO box or virtual mailbox) and a working way to opt out.
     postal_address: str = ""
+    # Only these recipients' countries get the postal address (two-letter
+    # codes, e.g. ["US", "CA"]: CAN-SPAM and CASL ask for it, UK and EU rules
+    # don't). Empty: every cold email gets it. A recipient whose country
+    # Harvey can't be sure of gets it too.
+    postal_address_countries: list[str] = []
     # Must ask for wording Harvey recognises as an opt-out (OPT_OUT_WORDS,
     # HEBREW_OPT_OUT_WORDS).
     # "" leaves it off (and harvey warns).
@@ -412,6 +453,26 @@ class ComplianceConfig(BaseModel):
     # send time, so it holds for an email a human already approved, and for
     # replies as well as cold mail — "never contact" means never.
     do_not_contact: list[str] = []
+
+    @field_validator("postal_address_countries", mode="before")
+    @classmethod
+    def _country_codes(cls, value) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        codes = []
+        for item in value:
+            code = str(item or "").strip().upper()
+            code = {"UK": "GB", "USA": "US"}.get(code, code)
+            if not code:
+                continue
+            if len(code) != 2 or not code.isalpha():
+                raise ValueError(
+                    f"'{item}' isn't a two-letter country code (e.g. US, CA, GB)")
+            if code not in codes:
+                codes.append(code)
+        return codes
 
     @field_validator("postal_address", "opt_out_line", mode="before")
     @classmethod
@@ -474,11 +535,32 @@ def compliance_of(config) -> ComplianceConfig:
     return found if isinstance(found, ComplianceConfig) else ComplianceConfig()
 
 
-def compliance_footer_lines(config) -> list[str]:
-    """The lines added under every cold email: address, then opt-out line."""
+def compliance_footer_lines(config, postal: bool = True) -> list[str]:
+    """The lines added under a cold email: address, then opt-out line.
+    ``postal=False`` leaves the address off (a recipient outside
+    ``postal_address_countries``)."""
     compliance = compliance_of(config)
-    return [line for line in (compliance.postal_address.strip(),
-                              compliance.opt_out_line.strip()) if line]
+    address = compliance.postal_address.strip() if postal else ""
+    return [line for line in (address, compliance.opt_out_line.strip()) if line]
+
+
+def postal_address_for(config, country: str) -> bool:
+    """Whether a cold email to someone in ``country`` (two-letter code, ""
+    when Harvey isn't sure) carries the postal address."""
+    countries = compliance_of(config).postal_address_countries
+    return not countries or not country or country.upper() in countries
+
+
+def signature_of(config) -> str:
+    """The configured signature block, or ""."""
+    return str(getattr(getattr(config, "persona", None), "signature", "") or "").strip()
+
+
+def outgoing_footer(config, postal: bool = True) -> str:
+    """Everything Harvey adds under a cold email: the signature, then the
+    postal address (unless ``postal`` is False) and opt-out line."""
+    parts = [signature_of(config), "\n".join(compliance_footer_lines(config, postal))]
+    return "\n\n".join(part for part in parts if part)
 
 
 def compliance_notice(config) -> str:
@@ -603,6 +685,65 @@ class BrainConfig(BaseModel):
         return v
 
 
+CTA_DOMAIN_TAG = "{domain}"
+
+
+class CtaLinkConfig(BaseModel):
+    """One landing page and the businesses it's for."""
+    url: str
+    # Words that pick this page: matched (case-insensitive, at the start of a
+    # word) against the prospect's industry first, then the company's name
+    # and its own description. "freight" also matches "freight forwarding".
+    keywords: list[str] = []
+
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, v: str) -> str:
+        return _cta_url(v)
+
+    @field_validator("keywords", mode="before")
+    @classmethod
+    def _clean_keywords(cls, v):
+        if v is None:
+            return []
+        if isinstance(v, str):
+            v = [v]
+        return [str(k).strip().lower() for k in v if str(k).strip()]
+
+
+def _cta_url(v) -> str:
+    url = str(v or "").strip()
+    if not re.match(r"^https?://[^\s/?#]+\.[^\s/?#]+", url, re.IGNORECASE) or re.search(r"\s", url):
+        raise ValueError(f"'{v}' is not a link. Write the whole address, starting https://")
+    if url.count(CTA_DOMAIN_TAG) > 1:
+        raise ValueError(f"'{v}' has {CTA_DOMAIN_TAG} more than once")
+    return url
+
+
+class CtaConfig(BaseModel):
+    """A link to your site in every first email (writer.cta).
+
+    Harvey picks the page, never the model: the first of ``links`` whose
+    keywords match the business, else ``default``. ``{domain}`` in a link
+    becomes the recipient company's website domain (``?ref={domain}``), so a
+    visit can be traced back to the company. The model only decides where
+    the link sits in the email.
+    """
+    default: str = ""
+    links: list[CtaLinkConfig] = []
+
+    @field_validator("default", mode="before")
+    @classmethod
+    def _check_default(cls, v):
+        if v is None or not str(v).strip():
+            return ""
+        return _cta_url(v)
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.default or self.links)
+
+
 class WriterConfig(BaseModel):
     # Run every draft through one extra editing-only brain call using the
     # Humanizer skill's instructions (~/.claude/skills/humanizer/SKILL.md,
@@ -617,6 +758,13 @@ class WriterConfig(BaseModel):
     # The FACTS rule, the send gate and do-not-contact still apply. A file
     # that is set but can't be read stops writing until it's fixed.
     email_rules: str = ""
+    # A link in every first email, chosen per business (see CtaConfig).
+    cta: CtaConfig = CtaConfig()
+
+    @field_validator("cta", mode="before")
+    @classmethod
+    def _blank_cta(cls, v):
+        return CtaConfig() if v is None else v
 
     @field_validator("email_rules", mode="before")
     @classmethod
@@ -662,6 +810,31 @@ def load_email_rules(config) -> str:
     return text
 
 
+class SheetConfig(BaseModel):
+    """A Google Sheet of leads that Harvey shares with you (see harvey/sheet_sync.py).
+
+    Harvey adds a row for every first email it sends, reads the status column
+    back (you mark ``clicked``; ``bounced``, ``replied``, ``unsubscribed`` and
+    ``excluded`` stop that person), and never emails a company or address
+    that's already anywhere in the sheet. The sheet id and the service-account
+    key file go in .env (GOOGLE_SHEET_ID, GOOGLE_SHEETS_CREDENTIALS); share the
+    sheet with the service account's email as an editor.
+    """
+    enabled: bool = False
+    worksheet: str = "leads"
+    # Written in the source and template_used columns of Harvey's rows, and
+    # how Harvey tells its own rows from yours.
+    label: str = "harvey"
+
+    @field_validator("worksheet", "label", mode="before")
+    @classmethod
+    def _required_text(cls, v, info):
+        text = str(v if v is not None else "").strip()
+        if not text:
+            raise ValueError(f"sheet.{info.field_name} can't be empty")
+        return text
+
+
 class HarveyConfig(BaseModel):
     persona: PersonaConfig
     product: ProductConfig
@@ -671,6 +844,7 @@ class HarveyConfig(BaseModel):
     brain: BrainConfig = BrainConfig()
     compliance: ComplianceConfig = ComplianceConfig()
     writer: WriterConfig = WriterConfig()
+    sheet: SheetConfig = SheetConfig()
     # The file it was loaded from, so a running Harvey can re-read the
     # sending mode from that same file (refresh_sending_mode).
     _source_path: str | None = PrivateAttr(default=None)
@@ -706,6 +880,9 @@ class EnvConfig(BaseModel):
     m365_tenant_id: str = ""
     # Optional: only used when compliance.precleared.enabled is true.
     precleared_api_key: str = ""
+    # Optional: only used when sheet.enabled is true.
+    google_sheet_id: str = ""
+    google_sheets_credentials: str = ""
 
 
 def _format_validation_error(e: ValidationError) -> str:
@@ -821,6 +998,8 @@ def load_env() -> EnvConfig:
         m365_client_id=os.getenv("M365_CLIENT_ID", "").strip(),
         m365_tenant_id=os.getenv("M365_TENANT_ID", "").strip(),
         precleared_api_key=os.getenv("PRECLEARED_API_KEY", "").strip(),
+        google_sheet_id=os.getenv("GOOGLE_SHEET_ID", "").strip(),
+        google_sheets_credentials=os.getenv("GOOGLE_SHEETS_CREDENTIALS", "").strip(),
     )
     return env
 

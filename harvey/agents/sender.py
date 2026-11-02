@@ -20,10 +20,18 @@ from datetime import date, datetime, timedelta, timezone
 from harvey.brain import Brain
 from harvey.config import (
     HarveyConfig, EnvConfig, cold_daily_cap, compliance_footer_lines, compliance_notice,
-    compliance_of, live_do_not_contact, operator_timezone, send_window_of,
+    outgoing_footer, postal_address_for, signature_of,
+    compliance_of, follow_up_mode, live_do_not_contact, operator_timezone, send_window_of,
 )
+from harvey.signature import sign
+from harvey.cta import drop_cta, link_for_prospect, place_cta
 from harvey.gate import autopilot_review, do_not_contact_match, pre_send_check
-from harvey.send_window import in_window, next_send_time, recipient_country, recipient_zone
+from harvey.sheet_sync import (
+    CLICKED_KEY, IN_SHEET_STATUS, sheet_hold_reason, sheet_match,
+)
+from harvey.send_window import (
+    in_window, next_send_time, recipient_country, recipient_zone, zone_country,
+)
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient, clear_hold, record_hold
@@ -56,7 +64,12 @@ DOMAINS_FAILING_TO_PAUSE = 2
 CHECK_SECONDS_PER_CYCLE = 90
 
 # Prospect pipeline statuses that mean "stop emailing this person".
-STOP_STATUSES = {"replied", "opted_out", "lost", "meeting", "closed"}
+STOP_STATUSES = {"replied", "opted_out", "lost", "meeting", "closed", IN_SHEET_STATUS}
+
+# Why a follow-up didn't go (channels.email.follow_ups). A follow-up held
+# for a click is revived when the click arrives (stage_follow_up).
+NOT_CLICKED_REASON = "follow-ups only go to people marked clicked in the sheet"
+FOLLOW_UPS_OFF_REASON = "follow-ups are off (channels.email.follow_ups)"
 
 KILL_SWITCH_KEY = "sending_paused"
 BOUNCE_COUNT_KEY = "bounce_count"
@@ -617,6 +630,7 @@ class Sender:
         now = _utcnow()
         seen_emails: set[str] = set()
         window = send_window_of(self.config)
+        mode = follow_up_mode(self.config)
 
         for prospect_id in campaign.prospect_ids:
             prospect = await self.state.get_prospect(prospect_id)
@@ -638,19 +652,26 @@ class Sender:
             # With a send window, each email is planned for the recipient's
             # office hours; follow-ups keep their delay, then move into it.
             zone = await self._zone_or_default(prospect) if window is not None else ""
+            link = await link_for_prospect(self.state, self.config, prospect)
             cumulative_days = 0
             for step in campaign.sequence:
                 cumulative_days += max(0, step.delay_days)
+                if step.step > 1 and mode != "auto":
+                    # "clicked": email 2 is staged when the sheet says they
+                    # clicked (stage_follow_up); "off": never.
+                    continue
                 send_at = now + timedelta(days=cumulative_days)
                 if window is not None:
                     send_at = next_send_time(send_at, zone, window)
+                body = self._render(step.body, prospect)
+                body = place_cta(body, link) if step.step == 1 else drop_cta(body)
                 item_id = await self.state.add_outbox_item(
                     prospect_id=prospect.id,
                     campaign_id=campaign.id,
                     step=step.step,
                     to_email=email,
-                    subject=self._render(step.subject, prospect),
-                    body=self._render(step.body, prospect),
+                    subject=drop_cta(self._render(step.subject, prospect)),
+                    body=body,
                     send_at=send_at.isoformat(),
                     status=initial_status,
                     provider=self.provider.name,
@@ -685,21 +706,100 @@ class Sender:
                 details={"campaign": campaign.name, "staged": staged, "mode": mode},
             )
 
-    def _with_footer(self, body: str) -> str:
-        """A cold email as it leaves: the postal address and opt-out line
-        underneath (CAN-SPAM). Added at send time, so a changed address
-        applies to mail already queued; not added again when the body already
-        ends with it."""
-        footer = "\n".join(compliance_footer_lines(self.config))
+    async def stage_follow_up(self, prospect_id: str) -> str | None:
+        """Queue email 2 for someone who clicked (follow_ups: clicked).
+
+        Returns the outbox id, or None when there's nothing to queue: no first
+        email went out, they replied, opted out or bounced, someone at their
+        company answered, or email 2 is already queued or sent. It goes
+        through the same approval, cap, window and spacing as any follow-up:
+        at least the campaign's delay after email 1 actually went out.
+        """
+        prospect = await self.state.get_prospect(prospect_id)
+        if prospect is None or prospect.status != "contacted":
+            return None
+        if (prospect.email_status or "guess") == "invalid":
+            return None
+        if await self.state.colleague_who_replied(prospect.id):
+            return None
+        first = await self.state.get_sequence_item(prospect.id, 1, status="sent")
+        if not first:
+            return None
+        campaign = await self.state.get_campaign(first.get("campaign_id") or "")
+        step = next((s for s in campaign.sequence if s.step == 2), None) if campaign else None
+        if step is None:
+            return None
+
+        await sync_sending_mode(self.config, self.state)
+        require_approval = getattr(self.config.channels.email, "require_approval", True)
+        status = "pending_review" if require_approval else "approved"
+        approved_by = "" if require_approval else "autopilot"
+        try:
+            sent_at = datetime.fromisoformat(str(first.get("sent_at")))
+        except (TypeError, ValueError):
+            sent_at = _utcnow()
+        send_at = max(_utcnow(), sent_at + max(MIN_FOLLOW_UP_GAP, timedelta(days=step.delay_days)))
+        window = send_window_of(self.config)
+        if window is not None:
+            send_at = next_send_time(send_at, await self._zone_or_default(prospect), window)
+
+        existing = await self.state.get_sequence_item(prospect.id, 2, campaign_id=campaign.id)
+        if existing:
+            # Held back before the click arrived: bring it back.
+            if existing["status"] == "cancelled" and existing.get("error") == NOT_CLICKED_REASON:
+                await self.state.update_outbox_item(
+                    existing["id"], status=status, error="", send_at=send_at.isoformat(),
+                    approved_by=approved_by)
+                return existing["id"]
+            return None
+        return await self.state.add_outbox_item(
+            prospect_id=prospect.id,
+            campaign_id=campaign.id,
+            step=2,
+            to_email=prospect.email,
+            subject=drop_cta(self._render(step.subject, prospect)),
+            body=drop_cta(self._render(step.body, prospect)),
+            send_at=send_at.isoformat(),
+            status=status,
+            provider=getattr(self.provider, "name", ""),
+            approved_by=approved_by,
+        )
+
+    def _with_signature(self, body: str) -> str:
+        """``body`` signed with persona.signature (unchanged when there's none)."""
+        persona = getattr(self.config, "persona", None)
+        return sign(body, signature_of(self.config), getattr(persona, "name", ""))
+
+    def _with_footer(self, body: str, postal: bool = True) -> str:
+        """A cold email as it leaves: the signature, then the postal address
+        and opt-out line underneath (CAN-SPAM). Added at send time, so a
+        changed address applies to mail already queued; not added again when
+        the body already ends with it. ``postal=False``: no address."""
+        if body.rstrip().endswith(outgoing_footer(self.config, postal)):
+            return body
+        body = self._with_signature(body)
+        footer = "\n".join(compliance_footer_lines(self.config, postal))
         if not footer or body.rstrip().endswith(footer):
             return body
         return body.rstrip() + "\n\n" + footer
 
-    def _outgoing_body(self, item: dict) -> str:
-        """The exact body that goes out: cold email gets the footer, replies don't."""
+    def _outgoing_body(self, item: dict, postal: bool = True) -> str:
+        """The exact body that goes out: cold email gets the signature and
+        footer, a reply just the signature."""
         if item["kind"] == "sequence":
-            return self._with_footer(item["body"])
-        return item["body"]
+            return self._with_footer(item["body"], postal)
+        return self._with_signature(item["body"])
+
+    async def _postal_for(self, prospect) -> bool:
+        """Whether this recipient's cold email carries the postal address:
+        always, unless compliance.postal_address_countries names countries
+        and Harvey is sure the recipient is in none of them."""
+        if not compliance_of(self.config).postal_address_countries or prospect is None:
+            return True
+        country = await self._recipient_country(prospect)
+        if not country and getattr(prospect, "timezone", ""):
+            country = zone_country(prospect.timezone)
+        return postal_address_for(self.config, country)
 
     async def _follow_up_order(self, item: dict, prospect=None) -> str | tuple[str, str] | None:
         """For a follow-up: "wait" until the email before it went out and its
@@ -774,10 +874,30 @@ class Sender:
             colleague = await self.state.colleague_who_replied(prospect.id)
             if colleague:
                 return "cancelled", f"{COLLEAGUE_REPLIED} ({colleague})"
+            if int(item["step"]) == 1:
+                # The lead sheet: a company or address already in it is
+                # yours (emailed before, or in your own pipeline).
+                in_sheet = await sheet_match(self.state, self.config, prospect)
+                if in_sheet:
+                    if prospect.status in ("new", "queued"):
+                        await self.state.update_prospect_status(prospect.id, IN_SHEET_STATUS)
+                    return "cancelled", f"already in your lead sheet ({in_sheet})"
+                waiting = await sheet_hold_reason(self.state, self.config)
+                if waiting:
+                    return "approved", waiting   # stays queued; checked again next cycle
+            else:
+                mode = follow_up_mode(self.config)
+                if mode == "off":
+                    return "cancelled", FOLLOW_UPS_OFF_REASON
+                if mode == "clicked" and (
+                        int(item["step"]) > 2
+                        or not await self.state.get_setting(CLICKED_KEY + prospect.id)):
+                    return "cancelled", NOT_CLICKED_REASON
+        postal = await self._postal_for(prospect)
         gate = pre_send_check(
-            item["to_email"], item["subject"], self._outgoing_body(item),
+            item["to_email"], item["subject"], self._outgoing_body(item, postal),
             prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
-            postal_address=compliance_of(self.config).postal_address,
+            postal_address=compliance_of(self.config).postal_address if postal else "",
             do_not_contact=live_do_not_contact(self.config),
         )
         if not gate:
@@ -793,7 +913,7 @@ class Sender:
         if item.get("approved_by") != "you":
             # Nobody approved this one (autopilot): what a planted
             # instruction would add sends it back to you instead.
-            held = autopilot_review(item["subject"], self._outgoing_body(item), self.config,
+            held = autopilot_review(item["subject"], self._outgoing_body(item, postal), self.config,
                                     recipient=item["to_email"])
             if held:
                 logger.warning(f"Sender: holding email to {item['to_email']} for review: {held}")
@@ -1015,7 +1135,7 @@ class Sender:
                     item["id"], status=blocked[0], error=blocked[1])
                 continue
 
-            body = self._outgoing_body(item)
+            body = self._outgoing_body(item, await self._postal_for(prospect))
             try:
                 result = await self.provider.send_email(
                     item["to_email"], item["subject"], body,

@@ -35,6 +35,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The Google Sheet sync (sheet.enabled): signs in as a service account.
+sheets = [
+    "google-auth>=2.20,<3",
+]
 dev = [
     "pytest>=8.0,<9",
     "pytest-asyncio>=0.23,<1",

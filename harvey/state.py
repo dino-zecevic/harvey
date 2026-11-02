@@ -1178,8 +1178,37 @@ class StateManager:
 
     _OUTBOX_COLUMNS = frozenset({
         "status", "error", "message_id", "thread_ref", "sent_at",
-        "subject", "body", "send_at", "provider",
+        "subject", "body", "send_at", "provider", "approved_by",
     })
+
+    async def get_sequence_item(self, prospect_id: str, step: int,
+                                campaign_id: str | None = None,
+                                status: str | None = None) -> dict | None:
+        """The newest cold (sequence) outbox row for this prospect and step."""
+        sql = "SELECT * FROM outbox WHERE prospect_id = ? AND kind = 'sequence' AND step = ?"
+        params: list = [prospect_id, int(step)]
+        if campaign_id is not None:
+            sql += " AND campaign_id = ?"
+            params.append(campaign_id)
+        if status is not None:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY created_at DESC LIMIT 1"
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_sent_sequence_items(self, step: int) -> list[dict]:
+        """Every cold email of this step that went out, oldest first."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM outbox WHERE kind = 'sequence' AND step = ? AND status = 'sent' "
+                "ORDER BY sent_at ASC, created_at ASC", (int(step),),
+            ) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
 
     async def update_outbox_item(self, item_id: str, **kwargs):
         fields = {k: v for k, v in kwargs.items() if k in self._OUTBOX_COLUMNS}
@@ -2287,6 +2316,22 @@ class StateManager:
             )
             await db.commit()
         return campaign.id
+
+    async def get_campaign(self, campaign_id: str) -> Campaign | None:
+        if not campaign_id:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM campaigns WHERE id = ?", (campaign_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["sequence"] = Campaign.sequence_from_json(d.pop("sequence_json"))
+        d["prospect_ids"] = json.loads(d.pop("prospect_ids_json") or "[]")
+        return Campaign(**d)
 
     async def get_campaigns_by_status(self, status: str) -> list[Campaign]:
         async with self._connect() as db:
