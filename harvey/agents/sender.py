@@ -24,6 +24,7 @@ from harvey.config import (
     compliance_of, follow_up_mode, live_do_not_contact, operator_timezone, send_window_of,
 )
 from harvey.signature import sign
+from harvey.agents.writer import DO_NOT_CONTACT_STATUS
 from harvey.cta import drop_cta, link_for_prospect, place_cta
 from harvey.gate import autopilot_review, do_not_contact_match, pre_send_check
 from harvey.sheet_sync import (
@@ -64,11 +65,12 @@ DOMAINS_FAILING_TO_PAUSE = 2
 CHECK_SECONDS_PER_CYCLE = 90
 
 # Prospect pipeline statuses that mean "stop emailing this person".
-STOP_STATUSES = {"replied", "opted_out", "lost", "meeting", "closed", IN_SHEET_STATUS}
+STOP_STATUSES = {"replied", "opted_out", "lost", "meeting", "closed", IN_SHEET_STATUS,
+                 DO_NOT_CONTACT_STATUS}
 
 # Why a follow-up didn't go (channels.email.follow_ups). A follow-up held
 # for a click is revived when the click arrives (stage_follow_up).
-NOT_CLICKED_REASON = "follow-ups only go to people marked clicked in the sheet"
+NOT_CLICKED_REASON = "follow-ups only go to people marked as clicked"
 FOLLOW_UPS_OFF_REASON = "follow-ups are off (channels.email.follow_ups)"
 
 KILL_SWITCH_KEY = "sending_paused"

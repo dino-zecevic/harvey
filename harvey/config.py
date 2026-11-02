@@ -257,7 +257,8 @@ class EmailChannelConfig(BaseModel):
     send_window: SendWindowConfig | None = None
     # Which follow-ups (sequence emails after the first) go out. "auto": the
     # whole sequence, until they reply. "clicked": only email 2, and only to
-    # people marked clicked in the lead sheet (see SheetConfig). "off": the
+    # people marked clicked (`harvey clicked`, the dashboard's Contacts tab,
+    # or the lead sheet, see SheetConfig). "off": the
     # first email only. Native providers only.
     follow_ups: str = "auto"
 

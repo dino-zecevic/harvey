@@ -16,8 +16,10 @@ from datetime import datetime, timezone
 
 from harvey.brain import Brain
 from harvey.config import (
-    EmailRulesError, HarveyConfig, compliance_of, load_email_rules, signature_of,
+    EmailRulesError, HarveyConfig, compliance_of, live_do_not_contact, load_email_rules,
+    signature_of,
 )
+from harvey.gate import do_not_contact_match
 from harvey.humanize import humanize, humanizer_enabled
 from harvey.cta import CTA_RULE, CTA_SEQUENCE_RULE, cta_config, drop_cta, link_for_prospect, place_cta
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
@@ -29,6 +31,9 @@ from harvey.startups import startup_facts
 from harvey.untrusted import UNTRUSTED_RULE, fence
 
 logger = logging.getLogger("harvey.writer")
+
+# A prospect on compliance.do_not_contact: never written for, never emailed.
+DO_NOT_CONTACT_STATUS = "do_not_contact"
 
 # How many times the model may fail to write a usable sequence for a
 # prospect before Harvey stops trying (status 'write_failed'). A provider
@@ -162,6 +167,19 @@ class Writer:
             p for p in prospects_with_email
             if not await self.state.colleague_who_replied(p.id)
         ]
+        # On the do-not-contact list: the send gate would block it anyway,
+        # so no draft to review, and out of the 'new' pool for good.
+        blocked_list = live_do_not_contact(self.config)
+        if blocked_list:
+            keep = []
+            for p in prospects_with_email:
+                hit = do_not_contact_match(p.email, blocked_list)
+                if hit:
+                    await self.state.update_prospect_status(p.id, DO_NOT_CONTACT_STATUS)
+                    logger.info(f"Writer: skipping {p.email}: '{hit}' is on the do-not-contact list.")
+                else:
+                    keep.append(p)
+            prospects_with_email = keep
         # Already in the lead sheet (emailed before, or in your own
         # pipeline): no draft, and out of the 'new' pool for good.
         if sheet_enabled(self.config):

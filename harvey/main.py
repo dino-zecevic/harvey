@@ -281,8 +281,8 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     )
     from harvey.config import follow_up_mode
     if follow_up_mode(config) == "clicked" and not config.sheet.enabled:
-        logger.warning("channels.email.follow_ups is 'clicked' but the lead sheet is off "
-                       "(sheet.enabled), so no follow-up will ever go out.")
+        logger.info("Follow-ups go only to people marked as clicked: `harvey clicked <domain>` "
+                    "or the Clicked button on the dashboard's Contacts tab.")
     for notice in (sending_notice(config), compliance_notice(config)):
         if notice:
             logger.warning("=" * 60)

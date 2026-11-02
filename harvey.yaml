@@ -85,8 +85,9 @@ channels:
     #   weekdays_only: true      # Monday to Friday, in every country
     #   recipient_timezone: true  # false: one zone for everyone (quiet_hours.timezone)
     # Which follow-ups go out: auto (the whole sequence until they reply),
-    # clicked (only email 2, only to people marked "clicked" in the lead
-    # sheet, see sheet: below) or off (the first email only).
+    # clicked (only email 2, only to people marked as clicked: `harvey
+    # clicked <domain>`, the Clicked button on Contacts, or "clicked" in the
+    # lead sheet, see sheet: below) or off (the first email only).
     follow_ups: "auto"
   linkedin:
     enabled: false             # explicit opt-in; credentials alone do not enable it

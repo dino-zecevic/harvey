@@ -955,6 +955,45 @@ def cmd_sending(args):
     asyncio.run(_run())
 
 
+def cmd_clicked(args):
+    """Record link clicks by hand; with nothing given, list who got email 1."""
+    from harvey.clicks import click_target, contacted, find, mark_clicked
+    from harvey.config import follow_up_mode, load_config, load_env
+    from harvey.state import StateManager
+
+    async def _run():
+        config = load_config()
+        state = StateManager()
+        await state.init_db()
+        print()
+        if not args.targets:
+            people = await contacted(state)
+            if not people:
+                print("  Nobody has been sent a first email yet.\n")
+                return
+            print(f"  First emails sent: {len(people)}  (follow_ups: {follow_up_mode(config)})")
+            for prospect, domain, clicked_on in people:
+                mark = f"clicked {clicked_on}" if clicked_on else ""
+                print(f"    {domain or '-':32s} {prospect.email:40s} {mark}")
+            print("\n  Mark a click:  harvey clicked <domain>   (or paste the ?ref= link)\n")
+            return
+        from harvey.agents.sender import Sender
+        sender = Sender(None, state, config, load_env())
+        for raw in args.targets:
+            target = click_target(raw)
+            people = await find(state, target)
+            if not people:
+                print(f"  {raw}: nobody Harvey sent a first email to matches "
+                      f"'{target or raw}'. `harvey clicked` lists them.")
+                continue
+            for prospect in people:
+                print(f"  {target} ({prospect.email}): "
+                      f"{await mark_clicked(state, sender, config, prospect)}")
+        print()
+
+    asyncio.run(_run())
+
+
 def cmd_sheet(args):
     """The lead sheet: check the connection, or sync once now."""
     from harvey.config import follow_up_mode, load_config, load_env
@@ -1189,6 +1228,13 @@ def main():
         "sheet", help="Lead sheet: check the Google Sheet connection, or sync it now")
     sub.add_argument("sheet_action", nargs="?", default="status", choices=["status", "sync"])
     sub.set_defaults(func=cmd_sheet)
+
+    sub = subparsers.add_parser(
+        "clicked", help="Record that someone clicked your link (queues email 2 for approval)")
+    sub.add_argument("targets", nargs="*", metavar="DOMAIN",
+                     help="Company domain, email address, or the ?ref= link; none lists "
+                          "everyone who got a first email")
+    sub.set_defaults(func=cmd_clicked)
 
     # harvey usage
     sub = subparsers.add_parser("usage", help="Show brain usage and quota (Claude or Codex)")

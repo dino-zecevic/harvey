@@ -85,6 +85,7 @@ const STATUS = {
   bounced:        ['Bounced', 'bad'],
   write_failed:   ["Couldn't write", 'bad'],
   in_sheet:       ['In your sheet', 'idle'],
+  do_not_contact: ['Do not contact', 'idle'],
   queued:         ['Queued', 'active'],
   opted_out:      ['Opted out', 'bad'],
   // campaigns
@@ -2164,7 +2165,12 @@ function renderContacts() {
       '<td>' + badge(p.status) + '</td>' +
       '<td class="muted">' + sourceLabel(p.source) + '</td>' +
       '<td class="muted" style="white-space:nowrap">' + relTime(p.created_at) + '</td>' +
-      '<td><div class="cell-row">' + (p.status === 'opted_out' || p.opt_out_undone || _optOut.id === p.id
+      '<td><div class="cell-row">' +
+        (p.can_mark_clicked
+          ? '<button class="btn btn-secondary btn-sm" onclick="markClicked(' + i + ')" ' +
+            'title="They clicked the link in email 1: queue email 2 for your approval">Clicked</button>'
+          : (p.clicked ? '<span class="cell-sub" title="Marked as clicked">Clicked &#10003;</span>' : '')) +
+        (p.status === 'opted_out' || p.opt_out_undone || _optOut.id === p.id
         ? '<button class="btn btn-ghost btn-sm" onclick="toggleOptOut(' + i + ')" ' +
           'aria-expanded="' + (_optOut.id === p.id) + '" title="What made Harvey stop emailing them">' +
           (p.status === 'opted_out' ? 'Why?' : 'Opt-out history') + '</button>' : '') +
@@ -2174,6 +2180,27 @@ function renderContacts() {
   }
   rowsEl.innerHTML = html + '</tbody></table></div>' +
     '<div class="table-foot">' + rows.length + ' of ' + _prospects.length + ' contacts</div>';
+}
+
+// They clicked the link in email 1 (seen in your visit logs as ?ref=<domain>):
+// record it, and email 2 waits in the Outbox for approval.
+let _clickBusy = false;
+async function markClicked(i) {
+  const p = _prospects[i];
+  if (!p || _clickBusy) return;
+  _clickBusy = true;
+  try {
+    const r = await api('/api/prospects/' + encodeURIComponent(p.id) + '/clicked', {method: 'POST'});
+    if (r && r.success) {
+      p.clicked = true; p.can_mark_clicked = false;
+      showToast((p.first_name || p.email) + ': ' + r.message, 'success');
+    } else {
+      showToast((r && r.message) || 'Couldn\'t mark it as clicked.', 'error');
+    }
+  } finally {
+    _clickBusy = false;
+    renderContacts();
+  }
 }
 
 // Why someone is opted out, and undoing it. Harvey never moves anyone off

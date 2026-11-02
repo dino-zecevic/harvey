@@ -917,9 +917,38 @@ async def get_prospects():
     undone = {r["pid"] for r in await query_db(
         "SELECT DISTINCT json_extract(details_json, '$.prospect_id') AS pid FROM actions "
         "WHERE action_type = 'opt_out_undone' AND json_valid(details_json)")}
+    # Who clicked (marked by hand or read from the lead sheet), for the
+    # Clicked button: shown once a first email went out, until it's marked.
+    clicked = {r["key"][len("clicked:"):] for r in await query_db(
+        "SELECT key FROM settings WHERE key LIKE 'clicked:%'")}
+    sent_first = {r["prospect_id"] for r in await query_db(
+        "SELECT DISTINCT prospect_id FROM outbox WHERE kind = 'sequence' AND step = 1 "
+        "AND status = 'sent'")}
     for r in rows:
         r["opt_out_undone"] = r.get("id") in undone
+        r["clicked"] = r.get("id") in clicked
+        r["can_mark_clicked"] = (r.get("id") in sent_first and not r["clicked"]
+                                 and r.get("status") == "contacted")
     return rows
+
+
+@app.post("/api/prospects/{prospect_id}/clicked")
+async def mark_prospect_clicked(prospect_id: str):
+    """They clicked the link in email 1: record it and queue email 2 for approval."""
+    try:
+        from harvey.agents.sender import Sender
+        from harvey.clicks import mark_clicked
+        from harvey.config import load_config, load_env
+        state = _state()
+        await state.init_db()
+        prospect = await state.get_prospect(prospect_id)
+        if prospect is None:
+            return JSONResponse({"success": False, "message": "No such contact."}, status_code=404)
+        config = load_config()
+        message = await mark_clicked(state, Sender(None, state, config, load_env()), config, prospect)
+        return {"success": True, "message": message}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
 def _state():
